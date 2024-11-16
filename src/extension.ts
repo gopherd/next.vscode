@@ -1,39 +1,39 @@
 import * as child_process from "child_process";
-import { workspace, ExtensionContext, window, OutputChannel } from "vscode";
+import * as path from "path";
+import { workspace, ExtensionContext, window, OutputChannel, commands } from "vscode";
 import {
   LanguageClient,
   LanguageClientOptions,
   ServerOptions,
+  State,
 } from "vscode-languageclient/node";
 
 let client: LanguageClient;
 let outputChannel: OutputChannel;
-let nextlsProcess: child_process.ChildProcess | null = null;
 
 export function activate(context: ExtensionContext) {
   try {
-    outputChannel = window.createOutputChannel("NPL Language Server");
-    outputChannel.appendLine("NPL Language Server is now active!");
+    outputChannel = window.createOutputChannel("Next Language Server");
+    outputChannel.appendLine("Next Language Server is now active!");
     outputChannel.show();
 
-    const config = workspace.getConfiguration('nextls');
-    const executablePath = config.get<string>('executablePath', 'nextls');
+    const config = workspace.getConfiguration("nextls");
+    let executablePath = config.get<string>("executablePath", "nextls");
 
-    const serverOptions: ServerOptions = function () {
-      return new Promise((resolve, reject) => {
-        nextlsProcess = child_process.spawn(executablePath);
-        nextlsProcess.on("error", (err) => {
-          window.showErrorMessage(`Failed to start nextls: ${err.message}`);
-          reject(err);
-        });
-        if (nextlsProcess.stderr) {
-          nextlsProcess.stderr.on("data", (data) => {
-            console.error(`nextls stderr: ${data}`);
-          });
-        }
+    // Adjust the PATH to include $HOME/bin
+    const env = { ...process.env };
+    const homeBin = path.join(process.env.HOME || "", "bin");
+    env.PATH = `${homeBin}${path.delimiter}${env.PATH}`;
 
-        resolve(nextlsProcess);
-      });
+    // Resolve the full path to the executable
+    if (!path.isAbsolute(executablePath)) {
+      executablePath = whichSync(executablePath, { path: env.PATH }) || executablePath;
+    }
+
+    const serverOptions: ServerOptions = {
+      command: executablePath,
+      args: [],
+      options: { env },
     };
 
     const clientOptions: LanguageClientOptions = {
@@ -44,14 +44,7 @@ export function activate(context: ExtensionContext) {
       synchronize: {
         fileEvents: workspace.createFileSystemWatcher("**/.clientrc"),
       },
-      middleware: {
-        provideDocumentSemanticTokens: (document, token, next) => {
-          outputChannel.appendLine(
-            `Requesting semantic tokens for ${document.uri.toString()}`
-          );
-          return next(document, token);
-        },
-      },
+      outputChannel,
     };
 
     outputChannel.appendLine("Creating language client...");
@@ -66,40 +59,47 @@ export function activate(context: ExtensionContext) {
     outputChannel.appendLine("Starting language client...");
     outputChannel.show();
 
-    var disposable = client.start();
+    const disposable = client.start();
 
     outputChannel.appendLine(
       "Language client started, waiting for ready event..."
     );
     outputChannel.show();
 
-    client
-      .onReady()
-      .then(() => {
-        outputChannel.appendLine("Language server is ready.");
-        outputChannel.appendLine("Server capabilities:");
+    client.onReady().then(() => {
+      outputChannel.appendLine("Language server is ready.");
+      outputChannel.appendLine("Server capabilities:");
+      outputChannel.appendLine(
+        JSON.stringify(client.initializeResult?.capabilities, null, 2)
+      );
+      outputChannel.appendLine("Adding event listeners...");
+
+      client.onDidChangeState((e) => {
         outputChannel.appendLine(
-          JSON.stringify(client.initializeResult?.capabilities, null, 2)
+          `Client state changed from ${State[e.oldState]} to ${State[e.newState]}`
         );
-        outputChannel.appendLine("Adding event listeners...");
-
-        client.onDidChangeState((e) => {
-          outputChannel.appendLine(
-            `Client state changed from ${e.oldState} to ${e.newState}`
-          );
-        });
-
-        client.onNotification("window/logMessage", (params) => {
-          outputChannel.appendLine(`Server log: ${params.message}`);
-        });
-      })
-      .catch((reason) => {
-        outputChannel.appendLine(`Failed to start language client: ${reason}`);
       });
+
+      client.onNotification("window/logMessage", (params) => {
+        outputChannel.appendLine(`Server log: ${params.message}`);
+      });
+    }).catch((reason) => {
+      outputChannel.appendLine(`Failed to start language client: ${reason}`);
+    });
 
     outputChannel.appendLine("Adding disposable to context.subscriptions");
     context.subscriptions.push(disposable);
-    outputChannel.appendLine("NPL Language Server activation completed");
+    outputChannel.appendLine("Next Language Server activation completed");
+
+    // Handle extension deactivation
+    context.subscriptions.push({
+      dispose: () => {
+        outputChannel.appendLine("Extension is being deactivated.");
+        if (client) {
+          client.stop();
+        }
+      },
+    });
   } catch (error) {
     outputChannel.appendLine(`Error: ${error}`);
     outputChannel.show();
@@ -110,10 +110,22 @@ export function deactivate(): Thenable<void> | undefined {
   if (!client) {
     return undefined;
   }
-  return client.stop().then(() => {
-    if (nextlsProcess) {
-      nextlsProcess.kill();
-      nextlsProcess = null;
-    }
-  });
+  return client.stop();
 }
+
+// Helper function to find the executable
+function whichSync(cmd: string, opts: { path: string }): string | null {
+  const paths = opts.path.split(path.delimiter);
+  for (const p of paths) {
+    const fullPath = path.join(p, cmd);
+    if (process.platform === "win32") {
+      if ([".exe", ".cmd", ".bat"].some(ext => fs.existsSync(fullPath + ext))) {
+        return fullPath;
+      }
+    } else if (fs.existsSync(fullPath)) {
+      return fullPath;
+    }
+  }
+  return null;
+}
+
